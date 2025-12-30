@@ -1,0 +1,3 @@
+# Ignore all test data (generated)
+src/
+dst/

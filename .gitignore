@@ -1,0 +1,41 @@
+# Build artifacts
+bin/
+obj/
+*.o
+*.a
+*.so
+*.d
+
+# AI/Claude context files
+.claude/
+CLAUDE.md
+CONTEXT.md
+
+# Test data (generated)
+test_data/src/
+test_data/dst/
+tests/perf/data/
+tests/perf/results/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug/core dumps
+core
+core.*
+*.core
+vgcore.*
+
+# Temporary files
+*.tmp
+*.log
