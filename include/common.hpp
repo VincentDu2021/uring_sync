@@ -18,6 +18,7 @@ enum class OpType {
     STATX,
     READ,
     WRITE,
+    COPY_FILE_RANGE,  // Zero-copy kernel-to-kernel copy (5.19+)
     CLOSE_SRC,
     CLOSE_DST,
     // Directory operations
@@ -37,7 +38,8 @@ enum class FileState {
     OPENING_DST,      // Waiting for dest open
     READING,          // Reading chunk
     WRITING,          // Writing chunk
-    SPLICING,         // Using splice for large file (zero-copy)
+    COPYING,          // Using copy_file_range (zero-copy, 5.19+)
+    SPLICING,         // Using splice for large file (zero-copy, requires pipe)
     CLOSING_SRC,      // Closing source fd
     CLOSING_DST,      // Closing dest fd
     DONE,             // Complete

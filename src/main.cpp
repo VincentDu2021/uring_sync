@@ -25,10 +25,11 @@ struct Config {
     int num_workers = 1;              // 1 = optimal for local copy (io_uring provides async parallelism)
     int queue_depth = 64;
     int chunk_size = 128 * 1024;      // 128KB
-    uint64_t splice_threshold = UINT64_MAX;  // Disabled - splice requires pipe, use read/write instead
+    uint64_t splice_threshold = UINT64_MAX;  // Disabled - splice requires pipe
     bool verbose = false;
     bool preserve = false;
     bool use_registered_buffers = false;  // Disabled - causes issues
+    bool use_copy_file_range = true;  // Use copy_file_range (kernel 5.19+) - zero-copy, much faster on network storage
     std::string src_path;
     std::string dst_path;
 };
@@ -149,8 +150,33 @@ void advance_state(FileContext* ctx, int result, RingManager& ring,
                 ctx->state = FileState::CLOSING_SRC;
                 ctx->current_op = OpType::CLOSE_SRC;
                 ring.prepare_close(ctx->src_fd, ctx);
+            } else if (cfg.use_copy_file_range) {
+                // Use copy_file_range syscall (sync) - zero-copy, data stays in kernel
+                // This is what 'cp' uses and is much faster on network storage
+                loff_t off_in = 0, off_out = 0;
+                ssize_t copied;
+                while (off_in < (loff_t)ctx->file_size) {
+                    copied = copy_file_range(ctx->src_fd, &off_in,
+                                            ctx->dst_fd, &off_out,
+                                            ctx->file_size - off_in, 0);
+                    if (copied <= 0) {
+                        if (copied < 0 && cfg.verbose) {
+                            fmt::print(stderr, "copy_file_range failed on {}: {}\n",
+                                      ctx->src_path, strerror(errno));
+                        }
+                        // Fall back to read/write if copy_file_range fails
+                        break;
+                    }
+                    stats.bytes_copied += copied;
+                }
+                ctx->offset = off_in;
+
+                // Go to closing
+                ctx->state = FileState::CLOSING_SRC;
+                ctx->current_op = OpType::CLOSE_SRC;
+                ring.prepare_close(ctx->src_fd, ctx);
             } else if (ctx->use_splice) {
-                // Use splice for large files (zero-copy in kernel)
+                // Use splice for large files (zero-copy in kernel, requires pipe)
                 ctx->state = FileState::SPLICING;
                 uint32_t to_splice = std::min((uint64_t)cfg.chunk_size,
                                               ctx->file_size - ctx->offset);
@@ -158,7 +184,7 @@ void advance_state(FileContext* ctx, int result, RingManager& ring,
                                    ctx->dst_fd, ctx->offset,
                                    to_splice, 0, ctx);
             } else {
-                // Use read/write for small files
+                // Fallback: use read/write
                 ctx->state = FileState::READING;
                 ctx->current_op = OpType::READ;
                 uint32_t to_read = std::min((uint64_t)cfg.chunk_size,

@@ -116,13 +116,14 @@ public:
         if (link) sqe->flags |= IOSQE_IO_LINK;
     }
 
-    // Splice/copy_file_range - kernel-to-kernel zero copy for large files
+    // Splice - kernel-to-kernel zero copy (requires pipe)
     void prepare_splice(int fd_in, int64_t off_in, int fd_out, int64_t off_out,
                         unsigned int len, unsigned int flags, FileContext* ctx) {
         struct io_uring_sqe* sqe = get_sqe();
         io_uring_prep_splice(sqe, fd_in, off_in, fd_out, off_out, len, flags);
         io_uring_sqe_set_data(sqe, ctx);
     }
+
 
     // Create directory asynchronously
     void prepare_mkdirat(int dirfd, const char* path, mode_t mode, FileContext* ctx) {
