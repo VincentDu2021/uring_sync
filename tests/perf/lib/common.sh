@@ -208,7 +208,8 @@ run_uring() {
     local src="$1"
     local dst="$2"
     local workers="${3:-1}"
+    local queue_depth="${4:-64}"
     rm -rf "$dst"
     mkdir -p "$dst"
-    "$URING_BINARY" -j "$workers" "$src" "$dst"
+    "$URING_BINARY" -j "$workers" -q "$queue_depth" "$src" "$dst"
 }
