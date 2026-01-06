@@ -209,7 +209,12 @@ run_uring() {
     local dst="$2"
     local workers="${3:-1}"
     local queue_depth="${4:-64}"
+    local sync_mode="${5:-false}"
     rm -rf "$dst"
     mkdir -p "$dst"
-    "$URING_BINARY" -j "$workers" -q "$queue_depth" "$src" "$dst"
+    if [[ "$sync_mode" == "true" ]]; then
+        "$URING_BINARY" --sync --quiet "$src" "$dst"
+    else
+        "$URING_BINARY" -j "$workers" -q "$queue_depth" --quiet "$src" "$dst"
+    fi
 }

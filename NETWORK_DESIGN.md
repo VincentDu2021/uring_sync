@@ -5,19 +5,19 @@
 ## Overview
 
 Extend uring-sync with network transfer capability:
-- **kTLS** (Kernel TLS) for efficient encryption
+- **kTLS** (Kernel TLS) for efficient encryption in kernel
 - **io_uring** for async batched network I/O
-- **Pre-shared key** authentication (simple, no certificate management)
-- **Auto-generated TLS certificates** (zero configuration)
+- **PSK (Pre-Shared Key)** - derive TLS keys from `--secret`, no certificates needed
+- **Zero-copy** - splice file data directly to encrypted socket
 
 Target use case: Fast file transfer within trusted internal networks.
 
 ## Goals
 
-1. **Simple setup** - No complex certificate infrastructure
-2. **Fast** - Leverage kTLS for kernel-level encryption, splice for zero-copy
-3. **Secure enough** - Encrypted transport, shared secret authentication
-4. **Compatible** - Works alongside existing local copy mode
+1. **Leverage io_uring** - This is the point of the project
+2. **Zero-copy encryption** - splice file → kTLS socket (kernel encrypts)
+3. **Simple setup** - No certificates, just `--secret`
+4. **Beat SSH tunnel** - Current SSH bottleneck is ~26 MB/s
 
 ## Security Model
 
@@ -31,7 +31,9 @@ Target use case: Fast file transfer within trusted internal networks.
 | Man-in-the-middle | ⚠️ Partial | TLS + secret (no cert pinning) |
 | Malicious insider | ❌ No | Trusted network assumption |
 
-### Authentication Flow
+### Authentication Flow (PSK-based)
+
+No TLS handshake needed - both sides derive keys from shared secret:
 
 ```
 SENDER                                    RECEIVER
@@ -39,19 +41,72 @@ SENDER                                    RECEIVER
    │  TCP connect                             │
    ├─────────────────────────────────────────►│
    │                                          │
-   │  TLS handshake (self-signed cert OK)     │
-   │◄────────────────────────────────────────►│
-   │                                          │
-   │  HELLO { version, secret }               │
+   │  HELLO { version, nonce_s }              │
    ├─────────────────────────────────────────►│
-   │                                     verify secret
-   │                                          │
-   │  HELLO_OK { }                            │
+   │                                     derive keys from
+   │                                     secret + nonces
+   │  HELLO_OK { nonce_r }                    │
    │◄─────────────────────────────────────────┤
    │                                          │
-   │  (file transfers begin)                  │
+   │  derive keys from                        │
+   │  secret + nonces                         │
+   │                                          │
+   │  Enable kTLS (both sides)                │
+   │                                          │
+   │  [encrypted: file transfers begin]       │
    │                                          │
 ```
+
+### PSK Key Derivation
+
+Both sides derive the same TLS keys from the shared secret:
+
+```cpp
+// Derive TLS keys using HKDF (RFC 5869)
+// Input: secret (from --secret), nonce_s (sender), nonce_r (receiver)
+
+void derive_ktls_keys(const std::string& secret,
+                      const uint8_t nonce_s[16],
+                      const uint8_t nonce_r[16],
+                      tls12_crypto_info_aes_gcm_128& tx_key,
+                      tls12_crypto_info_aes_gcm_128& rx_key) {
+    // Combine nonces for uniqueness
+    uint8_t salt[32];
+    memcpy(salt, nonce_s, 16);
+    memcpy(salt + 16, nonce_r, 16);
+
+    // HKDF-Extract
+    uint8_t prk[32];
+    HKDF_Extract(EVP_sha256(), salt, 32,
+                 secret.data(), secret.size(), prk);
+
+    // HKDF-Expand for TX key (sender→receiver)
+    uint8_t tx_material[32 + 12];  // key + IV
+    HKDF_Expand(EVP_sha256(), prk, 32,
+                "uring-sync-tx", 14,
+                tx_material, sizeof(tx_material));
+
+    // HKDF-Expand for RX key (receiver→sender)
+    uint8_t rx_material[32 + 12];
+    HKDF_Expand(EVP_sha256(), prk, 32,
+                "uring-sync-rx", 14,
+                rx_material, sizeof(rx_material));
+
+    // Fill kTLS structs
+    tx_key.info.version = TLS_1_2_VERSION;
+    tx_key.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+    memcpy(tx_key.key, tx_material, 16);
+    memcpy(tx_key.iv, tx_material + 16, 4);
+    memcpy(tx_key.rec_seq, tx_material + 20, 8);
+    // ... similar for rx_key with swapped direction
+}
+```
+
+**Why this works:**
+- Each connection has unique nonces → unique keys
+- HKDF is a standard, proven key derivation function
+- No certificates needed - both sides share the secret
+- Replay protection via nonces
 
 ### Secret Management
 
@@ -75,17 +130,19 @@ $ export URING_SYNC_SECRET="my-secret"
 $ uring-sync recv /backup -l 8443
 ```
 
-### Auto-Generated TLS Certificates
+### Why PSK instead of Certificates?
 
-On first run, uring-sync generates a self-signed certificate:
+| Approach | Complexity | Setup | Security |
+|----------|------------|-------|----------|
+| OpenSSL + Certs | High | Generate certs, distribute, manage expiry | Strong (PKI) |
+| OpenSSL + PSK | Medium | Need OpenSSL handshake code | Strong |
+| **Direct PSK + kTLS** | **Low** | Just `--secret` | Good enough |
 
-```
-~/.uring-sync/
-├── server.key      # RSA 2048-bit private key
-└── server.crt      # Self-signed cert, valid 10 years
-```
-
-No manual setup required. The certificate is only for encryption, not identity verification (the shared secret handles authentication).
+For our use case (io_uring showcase, internal networks), direct PSK is the right choice:
+- No certificate infrastructure
+- No OpenSSL handshake complexity
+- Reuse existing `--secret` parameter
+- Focus on the interesting part: io_uring + kTLS + splice
 
 ## Architecture
 
@@ -550,109 +607,148 @@ struct Config {
 };
 ```
 
-## kTLS Integration
+## kTLS Integration (PSK-based)
 
-### Setup Flow
+### The Key Insight: Skip OpenSSL Handshake
+
+Traditional kTLS requires:
+1. Do TLS handshake with OpenSSL
+2. Extract session keys from OpenSSL internals (complex!)
+3. Pass keys to kernel via setsockopt
+
+With PSK, we skip all that:
+1. Exchange nonces over plain TCP
+2. Derive keys from `--secret` + nonces using HKDF
+3. Pass keys directly to kernel
+
+### Setup Flow (Sender)
 
 ```cpp
-// ktls.hpp
+// ktls.hpp - simplified PSK-based kTLS
 #include <linux/tls.h>
-#include <openssl/ssl.h>
 
-class KTLSConnection {
-public:
-    // Create connection and do TLS handshake
-    // Returns socket fd with kTLS enabled, or -1 on error
-    static int connect(const std::string& host, uint16_t port,
-                      const std::string& cert_file,
-                      const std::string& key_file);
-
-    // Accept connection and do TLS handshake
-    // Returns socket fd with kTLS enabled, or -1 on error
-    static int accept(int listen_fd,
-                     const std::string& cert_file,
-                     const std::string& key_file);
-
-private:
-    // Enable kTLS on socket after handshake
-    static bool enable_ktls(int sockfd, SSL* ssl);
-
-    // Extract crypto keys from OpenSSL session
-    static bool extract_tls_keys(SSL* ssl,
-                                 struct tls12_crypto_info_aes_gcm_128* tx,
-                                 struct tls12_crypto_info_aes_gcm_128* rx);
-};
-```
-
-### kTLS Enable Implementation
-
-```cpp
-// ktls.cpp
-bool KTLSConnection::enable_ktls(int sockfd, SSL* ssl) {
-    // 1. Set TLS ULP (Upper Layer Protocol)
+bool enable_ktls_sender(int sockfd, const std::string& secret,
+                        const uint8_t nonce_s[16], const uint8_t nonce_r[16]) {
+    // 1. Enable TLS ULP on socket
     if (setsockopt(sockfd, SOL_TCP, TCP_ULP, "tls", sizeof("tls")) < 0) {
-        // Kernel doesn't support kTLS, fall back to userspace
+        return false;  // kTLS not available
+    }
+
+    // 2. Derive keys from PSK
+    tls12_crypto_info_aes_gcm_128 tx_key = {};
+    tls12_crypto_info_aes_gcm_128 rx_key = {};
+    derive_ktls_keys(secret, nonce_s, nonce_r, tx_key, rx_key);
+
+    // 3. Set TX key (for sending encrypted data)
+    if (setsockopt(sockfd, SOL_TLS, TLS_TX, &tx_key, sizeof(tx_key)) < 0) {
         return false;
     }
 
-    // 2. Extract keys from OpenSSL
-    struct tls12_crypto_info_aes_gcm_128 crypto_tx = {};
-    struct tls12_crypto_info_aes_gcm_128 crypto_rx = {};
-
-    if (!extract_tls_keys(ssl, &crypto_tx, &crypto_rx)) {
-        return false;
-    }
-
-    // 3. Set TX (send) crypto parameters
-    if (setsockopt(sockfd, SOL_TLS, TLS_TX, &crypto_tx, sizeof(crypto_tx)) < 0) {
-        return false;
-    }
-
-    // 4. Set RX (receive) crypto parameters
-    if (setsockopt(sockfd, SOL_TLS, TLS_RX, &crypto_rx, sizeof(crypto_rx)) < 0) {
+    // 4. Set RX key (for receiving encrypted data)
+    if (setsockopt(sockfd, SOL_TLS, TLS_RX, &rx_key, sizeof(rx_key)) < 0) {
         return false;
     }
 
     return true;
 }
+```
 
-// Check if kTLS is available on this system
-bool check_ktls_available() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+### Complete Handshake Sequence
 
-    int ret = setsockopt(fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls"));
-    int err = errno;
-    close(fd);
+```cpp
+// Sender side
+int setup_ktls_connection(const std::string& host, uint16_t port,
+                          const std::string& secret) {
+    // 1. TCP connect
+    int sockfd = connect_to_host(host, port);
 
-    // ENOPROTOOPT means kTLS not available
-    // ENOTCONN is expected (socket not connected), means kTLS is available
-    return ret == 0 || err == ENOTCONN;
+    // 2. Generate sender nonce
+    uint8_t nonce_s[16];
+    RAND_bytes(nonce_s, 16);
+
+    // 3. Send HELLO with our nonce
+    send_hello(sockfd, nonce_s);
+
+    // 4. Receive HELLO_OK with receiver's nonce
+    uint8_t nonce_r[16];
+    recv_hello_ok(sockfd, nonce_r);
+
+    // 5. Enable kTLS with derived keys
+    if (!enable_ktls_sender(sockfd, secret, nonce_s, nonce_r)) {
+        // Fallback: continue without encryption (or error)
+    }
+
+    // 6. Now socket is encrypted - io_uring ops work transparently
+    return sockfd;
 }
 ```
 
-### Fallback to Userspace TLS
+### Zero-Copy Data Path
 
-If kTLS is not available (older kernel), fall back to OpenSSL:
+After kTLS is enabled, the magic happens:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                     SENDER                                  │
+│                                                            │
+│   File (disk)                                              │
+│       │                                                    │
+│       │ io_uring SPLICE (file → pipe)                     │
+│       ▼                                                    │
+│   Kernel pipe buffer                                       │
+│       │                                                    │
+│       │ io_uring SPLICE (pipe → kTLS socket)              │
+│       ▼                                                    │
+│   kTLS layer (kernel encrypts with AES-NI)                │
+│       │                                                    │
+│       │ TCP send                                          │
+│       ▼                                                    │
+│   Network                                                  │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+
+Data path: file → kernel → network (ZERO userspace copies!)
+```
+
+### io_uring + kTLS Splice Implementation
 
 ```cpp
-class TLSConnection {
-public:
-    // Returns true if kTLS is active, false if using userspace SSL
-    bool is_ktls() const { return ktls_enabled_; }
+// Send file over kTLS socket using io_uring splice
+void send_file_zerocopy(RingManager& ring, int file_fd, int ktls_sockfd,
+                        int pipe_read, int pipe_write, uint64_t file_size) {
+    uint64_t offset = 0;
+    const size_t CHUNK = 128 * 1024;
 
-    // For kTLS: use io_uring send/recv directly on sockfd
-    // For userspace: must use SSL_read/SSL_write
+    while (offset < file_size) {
+        size_t len = std::min(file_size - offset, (uint64_t)CHUNK);
 
-    ssize_t send(const void* buf, size_t len);
-    ssize_t recv(void* buf, size_t len);
+        // Splice: file → pipe
+        ring.prepare_splice(file_fd, offset, pipe_write, -1, len,
+                           SPLICE_F_MOVE, &ctx_file_to_pipe);
 
-private:
-    int sockfd_;
-    SSL* ssl_;
-    bool ktls_enabled_;
-};
+        // Splice: pipe → kTLS socket (kernel encrypts)
+        ring.prepare_splice(pipe_read, -1, ktls_sockfd, -1, len,
+                           SPLICE_F_MOVE | SPLICE_F_MORE, &ctx_pipe_to_sock);
+
+        ring.submit_and_wait(2);
+        offset += len;
+    }
+}
 ```
+
+### Why This Is Fast
+
+| Path | Copies | Encryption | Syscalls/chunk |
+|------|--------|------------|----------------|
+| SSH tunnel (current) | 4+ | Userspace SSH | ~4 |
+| read/send + kTLS | 2 | Kernel | 2 |
+| **splice + kTLS** | **0** | **Kernel** | **2 (batched)** |
+
+The splice + kTLS path:
+- File data stays in kernel pages throughout
+- AES-NI hardware acceleration
+- io_uring batches multiple chunks
+- Expected: **50-100+ MB/s** vs 26 MB/s SSH
 
 ## Path Validation
 
@@ -721,42 +817,49 @@ uring-sync - High-performance file copier using io_uring
 
 USAGE:
     uring-sync [OPTIONS] <SOURCE> <DEST>           Local copy
-    uring-sync send [OPTIONS] <SOURCE> <HOST:PORT> Send to remote
-    uring-sync recv [OPTIONS] <DEST> -l <PORT>     Receive from remote
+    uring-sync send <SOURCE> <HOST:PORT> [OPTIONS] Send to remote
+    uring-sync recv <DEST> --listen <PORT> [OPTIONS] Receive from remote
 
 LOCAL COPY:
     uring-sync /src/dir /dst/dir
-    uring-sync -j 4 -v /data /backup
-
-SEND MODE:
-    uring-sync send /data server.local:8443 --secret "abc123"
-    uring-sync send /data server.local:8443 --secret-file ~/.secret
-
-RECV MODE:
-    uring-sync recv /incoming -l 8443              # Auto-generate secret
-    uring-sync recv /incoming -l 8443 --secret "abc123"
-
-OPTIONS:
-    -j, --jobs <N>          Worker threads (default: CPU count)
-    -c, --chunk-size <SIZE> I/O buffer size (default: 128K)
-    -q, --queue-depth <N>   io_uring queue depth (default: 64)
-    -v, --verbose           Verbose output
-    -h, --help              Show help
+    uring-sync -j 1 -v /data /backup
 
 NETWORK OPTIONS:
-    -l, --listen <PORT>     Listen port for recv mode (default: 8443)
-    --secret <STRING>       Shared secret for authentication
-    --secret-file <PATH>    Read secret from file
-    --no-ktls               Disable kernel TLS (use OpenSSL)
+    --secret <STRING>       Pre-shared secret for authentication
+    --tls                   Enable kTLS encryption (requires --secret)
+    --uring                 Use io_uring async batching (faster)
+    --splice                Use zero-copy splice (slower for small files)
+    -l, --listen <PORT>     Listen port for recv mode
+    -h, --help              Show help
+
+ENCRYPTION MODES:
+    1. Plaintext (trusted network):
+       uring-sync send /data host:9999 --secret key
+       uring-sync recv /dst --listen 9999 --secret key
+
+    2. Native kTLS (not yet implemented):
+       uring-sync send /data host:9999 --secret key --tls
+       uring-sync recv /dst --listen 9999 --secret key --tls
+
+    3. SSH tunnel (recommended for now):
+       # Terminal 1: Create tunnel
+       ssh -L 9999:localhost:9999 user@remote-host
+
+       # Remote host
+       uring-sync recv /dst --listen 9999 --secret key
+
+       # Local (through tunnel)
+       uring-sync send /data localhost:9999 --secret key
 
 EXAMPLES:
-    # Start receiver, note the generated secret
-    $ uring-sync recv /backup -l 8443
-    Listening on 0.0.0.0:8443
-    Secret: Kj8mX2pL9qRs
+    # Plaintext transfer (LAN/trusted network)
+    $ uring-sync recv /backup --listen 9999 --secret abc123
+    $ uring-sync send /data 192.168.1.100:9999 --secret abc123
 
-    # Send files using the secret
-    $ uring-sync send /data 192.168.1.100:8443 --secret Kj8mX2pL9qRs
+    # Using SSH tunnel for encryption
+    $ ssh -L 9999:localhost:9999 user@remote  # Terminal 1
+    $ uring-sync recv /backup --listen 9999 --secret abc123  # On remote
+    $ uring-sync send /data localhost:9999 --secret abc123   # Local
 ```
 
 ### Argument Parsing
@@ -794,60 +897,103 @@ int main(int argc, char* argv[]) {
 
 ## Implementation Phases
 
-### Phase 1: Basic Network Infrastructure
-- [ ] Add network ops to RingManager
-- [ ] Implement protocol message encode/decode
-- [ ] Basic sender: connect, send files over raw TCP (no TLS yet)
-- [ ] Basic receiver: accept, receive files, write to disk
-- [ ] Secret validation in HELLO
-- **Goal**: Working file transfer without encryption
+### Phase 1: PSK + kTLS Foundation (Current Goal)
 
-### Phase 2: TLS Integration
-- [ ] Add OpenSSL for TLS handshake
-- [ ] Auto-generate self-signed certificates
-- [ ] Implement userspace TLS send/recv
-- [ ] Test encrypted transfers
-- **Goal**: Secure file transfer with userspace TLS
+**Already Done:**
+- [x] Basic network sender/receiver (synchronous, plaintext)
+- [x] Wire protocol (HELLO, FILE_HDR, FILE_DATA, ALL_DONE)
+- [x] `--secret` authentication
 
-### Phase 3: kTLS Optimization
-- [ ] Detect kTLS availability
-- [ ] Extract keys and enable kTLS after handshake
-- [ ] Switch to io_uring send/recv with kTLS
-- [ ] Benchmark vs userspace TLS
-- **Goal**: Kernel-level encryption with io_uring
+**Next Steps:**
+- [ ] Update HELLO/HELLO_OK to include nonces
+- [ ] Implement HKDF key derivation from secret + nonces
+- [ ] Add `enable_ktls()` function with PSK-derived keys
+- [ ] Test kTLS encryption (sender TX, receiver RX)
+- **Goal**: Encrypted transfer without OpenSSL handshake
 
-### Phase 4: Zero-Copy Path
-- [ ] Implement splice file→socket for sender
-- [ ] Test splice socket→file for receiver (may need pipe)
-- [ ] Benchmark vs buffered I/O
-- **Goal**: Minimize memory copies
+### Phase 2: io_uring Network I/O
 
-### Phase 5: Polish
-- [ ] Progress reporting for network transfers
-- [ ] Proper error messages
-- [ ] Resume interrupted transfers (future)
-- [ ] Multiple parallel connections (future)
-- **Goal**: Production-ready tool
+Replace synchronous send/recv with io_uring:
+- [ ] Add `prepare_send()`, `prepare_recv()` to RingManager
+- [ ] Async sender state machine (similar to local copy)
+- [ ] Async receiver state machine
+- [ ] Benchmark: io_uring vs blocking I/O over kTLS
+- **Goal**: Async batched network I/O
+
+### Phase 3: Zero-Copy with Splice
+
+The ultimate goal - zero-copy encrypted transfer:
+- [ ] Implement splice file → pipe → kTLS socket (sender)
+- [ ] Implement splice kTLS socket → pipe → file (receiver)
+- [ ] Handle partial splice, EAGAIN
+- [ ] Benchmark vs read/send path
+- **Goal**: file → network without userspace copies
+
+### Phase 4: Benchmarking & Polish
+- [x] Compare vs SSH tunnel (kTLS 16% faster - see BENCHMARKS.md)
+- [x] Compare vs rsync for encrypted transfer (see BENCHMARKS.md)
+- [ ] Progress reporting
+- [ ] Error handling and recovery
+- **Goal**: Demonstrate io_uring + kTLS superiority
+
+### Key Milestones
+
+| Milestone | Expected Improvement |
+|-----------|---------------------|
+| Phase 1: kTLS working | Encryption without SSH |
+| Phase 2: io_uring net | Better latency, batching |
+| Phase 3: splice | **2-4x faster** than SSH (50-100 MB/s) |
 
 ## Performance Expectations
 
-### Theoretical Analysis
+See **BENCHMARKS.md** for actual benchmark results.
 
-| Path | Copies | Encryption |
-|------|--------|------------|
-| Userspace TLS | 4 (read→ssl→send→recv→ssl→write) | CPU |
-| kTLS buffered | 2 (read→send, recv→write) | Kernel |
-| kTLS + splice | 0-1 | Kernel |
+### Theoretical vs Actual: kTLS Performance
 
-### Expected Throughput (10GbE)
+| Path | Copies | Encryption | Expected | **Actual** |
+|------|--------|------------|----------|------------|
+| SSH tunnel | 4+ | Userspace SSH | ~26-38 MB/s | 25 MB/s |
+| kTLS + read/send | 2 | Kernel AES-NI | ~45 MB/s | **60 MB/s** |
+| kTLS + splice | 0 | Kernel AES-NI | 80-100 MB/s | **23 MB/s** ❌ |
 
-| Mode | Expected | Bottleneck |
-|------|----------|------------|
-| Userspace TLS | 2-4 Gbps | OpenSSL CPU |
-| kTLS buffered | 6-8 Gbps | Memory bandwidth |
-| kTLS + splice | 8-10 Gbps | Wire speed |
+### Why kTLS + read/send is Faster Than Expected
 
-Note: Actual results depend on CPU, NIC, and kernel version.
+1. **No userspace SSH process** - encryption in kernel
+2. **AES-NI directly** - hardware acceleration without context switches
+3. **Efficient socket buffering** - kernel manages send buffer well
+
+### Why kTLS + splice is SLOWER (Investigation: 2026-01-06)
+
+**Expectation:** Zero-copy splice should be fastest (file → pipe → kTLS socket)
+
+**Reality:** 2.9x slower than read/send (23 MB/s vs 60 MB/s)
+
+**Root cause:** `splice(pipe → socket)` blocks on network send
+
+```
+# strace output showing the problem:
+splice(file→pipe):   0.000027s (27μs)   ← instant
+splice(pipe→socket): 0.032897s (33ms)   ← BLOCKING 1000x slower!
+```
+
+**Why this happens:**
+1. `splice()` to a socket is synchronous - waits for data to leave socket buffer
+2. When TCP send buffer fills, splice blocks waiting for ACKs from receiver
+3. kTLS encryption happens inline during splice, compounding the blocking
+4. Each 100KB file causes a ~30-70ms block = 3000+ seconds for 100K files
+
+**Why read/send doesn't have this problem:**
+1. `sendto()` on kTLS socket buffers more aggressively
+2. Kernel can manage encryption + network send asynchronously
+3. Less per-call blocking, better pipelining
+
+**Potential fixes (not implemented):**
+1. Use `SPLICE_F_NONBLOCK` + poll/epoll between splices
+2. Use io_uring `IORING_OP_SPLICE` for async splice
+3. Larger pipe buffer to reduce blocking frequency
+
+**Conclusion:** For many-file workloads, `--tls` (read/send) is the right choice.
+`--splice` only benefits single large file transfers without kTLS.
 
 ## Testing Plan
 
@@ -892,6 +1038,9 @@ time scp -r /tmp/bench user@server:/tmp/recv/
 ## References
 
 - [Linux Kernel TLS Documentation](https://docs.kernel.org/networking/tls.html)
+- [kTLS header: linux/tls.h](https://github.com/torvalds/linux/blob/master/include/uapi/linux/tls.h)
 - [io_uring and Networking in 2023](https://github.com/axboe/liburing/wiki/io_uring-and-networking-in-2023)
-- [Using Kernel TLS with OpenSSL](https://delthas.fr/blog/2023/kernel-tls/)
+- [HKDF RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869)
+- [OpenSSL HKDF](https://www.openssl.org/docs/man3.0/man3/EVP_PKEY_CTX_set_hkdf_md.html)
 - [liburing API Reference](https://unixism.net/loti/ref-liburing/submission.html)
+- [splice(2) man page](https://man7.org/linux/man-pages/man2/splice.2.html)
