@@ -19,6 +19,8 @@ enum class OpType {
     READ,
     WRITE,
     COPY_FILE_RANGE,  // Zero-copy kernel-to-kernel copy (5.19+)
+    SPLICE_IN,        // splice: src_fd → pipe_write
+    SPLICE_OUT,       // splice: pipe_read → dst_fd
     CLOSE_SRC,
     CLOSE_DST,
     // Directory operations
@@ -39,7 +41,8 @@ enum class FileState {
     READING,          // Reading chunk
     WRITING,          // Writing chunk
     COPYING,          // Using copy_file_range (zero-copy, 5.19+)
-    SPLICING,         // Using splice for large file (zero-copy, requires pipe)
+    SPLICE_IN,        // Splicing: src_fd → pipe (zero-copy)
+    SPLICE_OUT,       // Splicing: pipe → dst_fd (zero-copy)
     CLOSING_SRC,      // Closing source fd
     CLOSING_DST,      // Closing dest fd
     DONE,             // Complete
@@ -67,17 +70,22 @@ struct FileContext {
     uint64_t offset = 0;          // Current read/write position
     mode_t mode = 0644;
 
-    // Buffer (assigned from pool)
+    // Buffer (assigned from pool) - used for read/write path
     char* buffer = nullptr;
     int buffer_index = -1;        // Index in buffer pool
     uint32_t last_read_size = 0;  // Bytes from last read
 
+    // Pipe (assigned from pool) - used for splice path
+    int pipe_read_fd = -1;        // Read end of pipe
+    int pipe_write_fd = -1;       // Write end of pipe
+    int pipe_index = -1;          // Index in pipe pool
+    uint32_t splice_len = 0;      // Bytes in current splice operation
+
     // For statx result
     struct statx stx;
 
-    // Optimization flags
-    bool use_splice = false;      // Use splice for this file (large files)
-    bool use_fixed_buffers = false;  // Use registered buffers
+    // Use splice for this file
+    bool use_splice = false;
 };
 
 // ============================================================
@@ -142,6 +150,87 @@ private:
 };
 
 // ============================================================
+// Pipe Pool - pre-allocated pipes for splice operations
+// ============================================================
+class PipePool {
+public:
+    // Pipe fds as a struct (can't use int[2] in vector)
+    struct Pipe {
+        int read_fd = -1;
+        int write_fd = -1;
+    };
+
+    explicit PipePool(size_t count, size_t pipe_size = 0) : count_(count) {
+        pipes_.resize(count);
+        available_.resize(count, true);
+        for (size_t i = 0; i < count; i++) {
+            int fds[2];
+            if (pipe(fds) < 0) {
+                // Clean up previously created pipes
+                for (size_t j = 0; j < i; j++) {
+                    close(pipes_[j].read_fd);
+                    close(pipes_[j].write_fd);
+                }
+                throw std::runtime_error("Failed to create pipe");
+            }
+            pipes_[i].read_fd = fds[0];
+            pipes_[i].write_fd = fds[1];
+            // Set pipe buffer to match chunk size (0 = use default 64KB)
+            if (pipe_size > 0) {
+                fcntl(fds[0], F_SETPIPE_SZ, pipe_size);
+            }
+        }
+    }
+
+    ~PipePool() {
+        for (auto& p : pipes_) {
+            if (p.read_fd >= 0) close(p.read_fd);
+            if (p.write_fd >= 0) close(p.write_fd);
+        }
+    }
+
+    // Non-copyable
+    PipePool(const PipePool&) = delete;
+    PipePool& operator=(const PipePool&) = delete;
+
+    // Acquire a pipe, returns {read_fd, write_fd, index} or {-1, -1, -1} if none available
+    struct PipeHandle {
+        int read_fd;
+        int write_fd;
+        int index;
+    };
+
+    PipeHandle acquire() {
+        for (size_t i = 0; i < count_; i++) {
+            if (available_[i]) {
+                available_[i] = false;
+                return {pipes_[i].read_fd, pipes_[i].write_fd, static_cast<int>(i)};
+            }
+        }
+        return {-1, -1, -1};
+    }
+
+    // Release a pipe back to the pool
+    void release(int index) {
+        if (index >= 0 && index < static_cast<int>(count_)) {
+            available_[index] = true;
+        }
+    }
+
+    size_t count() const { return count_; }
+    size_t available_count() const {
+        size_t c = 0;
+        for (bool a : available_) if (a) c++;
+        return c;
+    }
+
+private:
+    std::vector<Pipe> pipes_;
+    std::vector<bool> available_;
+    size_t count_;
+};
+
+// ============================================================
 // Statistics - atomic counters for progress
 // ============================================================
 struct Stats {
@@ -151,6 +240,75 @@ struct Stats {
     std::atomic<uint64_t> bytes_total{0};
     std::atomic<uint64_t> bytes_copied{0};
     std::atomic<uint64_t> dirs_created{0};
+};
+
+// ============================================================
+// Size Statistics - for adaptive chunk sizing
+// ============================================================
+struct SizeStats {
+    std::vector<uint64_t> samples;       // Sampled file sizes
+    uint64_t file_count = 0;             // Total files seen
+
+    // Add a file to sampling
+    // Uses reservoir-style sampling: always sample first 20, then every Nth
+    void observe(uint64_t size) {
+        file_count++;
+
+        // Always sample the first 20 files for small datasets
+        if (file_count <= 20) {
+            samples.push_back(size);
+            return;
+        }
+
+        // After that, sample every Nth file to keep ~100-200 samples max
+        // Interval grows with file count to cap memory usage
+        uint64_t interval = std::max(1UL, file_count / 100);
+        if (file_count % interval == 0 && samples.size() < 200) {
+            samples.push_back(size);
+        }
+    }
+
+    // Get percentile from samples (0-100)
+    uint64_t percentile(int pct) const {
+        if (samples.empty()) return 0;
+
+        std::vector<uint64_t> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+
+        size_t idx = (sorted.size() * pct) / 100;
+        if (idx >= sorted.size()) idx = sorted.size() - 1;
+        return sorted[idx];
+    }
+
+    // Pick optimal chunk size based on file size distribution
+    size_t pick_chunk_size() const {
+        if (samples.empty()) {
+            return 128 * 1024;  // Default 128KB
+        }
+
+        uint64_t p90 = percentile(90);
+
+        if (p90 <= 32 * 1024)   return 64 * 1024;
+        if (p90 <= 128 * 1024)  return 128 * 1024;
+        if (p90 <= 512 * 1024)  return 256 * 1024;
+        if (p90 <= 2 * 1024 * 1024) return 512 * 1024;
+        return 1024 * 1024;  // 1MB max
+    }
+
+    // Summary for logging
+    void print_summary() const {
+        if (samples.empty()) return;
+
+        uint64_t p50 = percentile(50);
+        uint64_t p90 = percentile(90);
+        uint64_t p99 = percentile(99);
+
+        // Using printf to avoid fmt dependency in header
+        printf("  File size distribution (from %zu samples):\n", samples.size());
+        printf("    p50: %lu bytes\n", (unsigned long)p50);
+        printf("    p90: %lu bytes\n", (unsigned long)p90);
+        printf("    p99: %lu bytes\n", (unsigned long)p99);
+    }
 };
 
 // ============================================================
@@ -236,6 +394,7 @@ private:
 struct FileWorkItem {
     std::string src_path;
     std::string dst_path;
+    ino_t inode = 0;  // For sorting by disk location
 };
 
 // Legacy struct for backwards compatibility (single-file mode)

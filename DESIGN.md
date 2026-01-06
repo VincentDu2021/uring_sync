@@ -315,22 +315,18 @@ io_uring_prep_read(sqe3, ...);
 // No link flag - end of chain
 ```
 
-### 2. Registered Buffers
+### 2. Registered Buffers (NOT BENEFICIAL)
 
-Pre-register buffers with the kernel to avoid per-operation mapping:
+Registered buffers (`io_uring_register_buffers`) pre-pin memory to avoid per-I/O mapping. However, benchmarks showed they **hurt performance** for file copy:
 
-```cpp
-// At init
-std::vector<iovec> iovecs(QUEUE_DEPTH);
-for (int i = 0; i < QUEUE_DEPTH; i++) {
-    iovecs[i].iov_base = buffers[i];
-    iovecs[i].iov_len = CHUNK_SIZE;
-}
-io_uring_register_buffers(&ring, iovecs.data(), QUEUE_DEPTH);
+| File Size | Normal | Registered | Difference |
+|-----------|--------|------------|------------|
+| 4KB | 73,907 files/s | 67,412 files/s | **-9%** |
+| 64KB | 20,817 files/s | 20,195 files/s | **-3%** |
 
-// When submitting reads/writes
-io_uring_prep_read_fixed(sqe, fd, buf, len, offset, buf_index);
-```
+**Why it doesn't help:** Registered buffers amortize their cost over many operations per buffer (e.g., network servers reusing receive buffers thousands of times). Our workload uses each buffer 1-2 times per file then releases it. The buffer index lookup overhead exceeds the pin/unpin savings.
+
+See `docs/registered-buffers-analysis.md` for detailed analysis.
 
 ### 3. Registered File Descriptors
 
@@ -371,6 +367,69 @@ if (auto it = inode_to_dest.find(statx.stx_ino); it != inode_to_dest.end()) {
     // Proceed with copy
 }
 ```
+
+### 6. File Ordering for Sequential Access
+
+Sort files by inode before processing to approximate physical disk order:
+
+```cpp
+// Current implementation: sort by inode
+std::sort(files.begin(), files.end(), [](const FileWorkItem& a, const FileWorkItem& b) {
+    return a.inode < b.inode;
+});
+```
+
+**Impact:** 8x improvement on network storage (48s → 6s for 10K files)
+
+**Limitations (TODO - adaptive sorting):**
+
+| Scenario | Issue | Potential Solution |
+|----------|-------|-------------------|
+| After defrag | Blocks reorganized, inodes unchanged | Re-stat after defrag |
+| Backup restore | New inodes in restore order | Accept limitation |
+| Btrfs/ZFS (CoW) | Inode order ≠ physical order | Use `fiemap` ioctl |
+| FAT32/exFAT | No inodes | Fall back to name sort |
+| NTFS | MFT records, not inodes | Use MFT order if available |
+| NFS/SMB | Synthetic inodes | Fall back to name sort |
+| FUSE (S3/GCS) | Fake inodes, no physical disk | Skip sorting |
+
+**Future improvement:** Detect filesystem type and choose optimal sorting:
+- ext4/xfs: inode sort (current)
+- Btrfs: `fiemap` ioctl for physical extent order
+- Network/FUSE: skip sorting or use name sort
+- Unknown: fall back to readdir order
+
+### 7. io_uring with Splice for Zero-Copy ✓ IMPLEMENTED
+
+Zero-copy file transfer via splice - data never enters userspace:
+
+```cpp
+// State machine: SPLICE_IN → SPLICE_OUT (per chunk)
+// SPLICE_IN: src_fd → pipe
+io_uring_prep_splice(sqe, src_fd, offset, pipe_write, -1, len, SPLICE_F_MOVE);
+// SPLICE_OUT: pipe → dst_fd
+io_uring_prep_splice(sqe, pipe_read, -1, dst_fd, offset, len, SPLICE_F_MOVE);
+```
+
+**Implementation details:**
+- PipePool class manages pipe pairs (one per in-flight file)
+- Pipe buffer sized to match chunk_size (128KB default)
+- Falls back to read/write if no pipe available
+
+**Performance impact (GCP pd-balanced, 100K × 4KB files, cold cache):**
+
+| Method | Time | vs cp |
+|--------|------|-------|
+| cp -r | 59.9s | baseline |
+| uring read/write | ~55s | 8% faster |
+| **uring splice** | **17.2s** | **3.5x faster** |
+
+**Pipe buffer tuning:**
+- 64KB (default): Works but suboptimal
+- 128KB (= chunk_size): Optimal, one splice fills buffer
+- 1MB: Too large, hurts network storage (3x slower!)
+
+**Future:** Linked splice ops (submit SPLICE_IN + SPLICE_OUT together)
 
 ## CLI Interface
 
@@ -423,9 +482,9 @@ Examples:
 
 ### Phase 4: Optimizations
 - [ ] Linked SQEs for open+read chains
-- [ ] Registered buffers
+- [x] Registered buffers - **Investigated, not beneficial** (see docs/registered-buffers-analysis.md)
 - [ ] Hard link detection
-- [ ] copy_file_range for large files
+- [ ] copy_file_range for large files (blocked: no kernel op)
 - [ ] NUMA-aware buffer allocation
 
 ### Phase 5: Production Features
@@ -487,21 +546,220 @@ For N small files, `cp -r` does N sequential file copies. With io_uring:
 
 ### Observed Results
 
+#### Local NVMe (cold cache)
+
+| Scenario | Files | cp -r | uring splice | uring no-splice | Speedup |
+|----------|-------|-------|--------------|-----------------|---------|
+| ml_large | 100K × 4KB | 7.67s | 5.14s | 5.05s | **1.5x** |
+| ml_images | 100K × 100KB | 22.7s | 5.4s | 8.1s | **4.2x** |
+
+Key findings on fast storage:
+- **Larger files benefit MORE** - 4.2x speedup for 100KB vs 1.5x for 4KB
+- **Splice beats no-splice** - Zero-copy matters at high throughput (3.8 GB/s vs 1.8 GB/s)
+- **CPU is the bottleneck** - Disk can keep up, syscall overhead limits cp
+
+#### Network Storage (GCP pd-balanced, cold cache, with burst credits)
+
 | Scenario | cp -r | uring-sync | Speedup | Notes |
 |----------|-------|------------|---------|-------|
-| 10K × 4KB (cold) | 0.78s | 0.48s | **1.6x** | Measured |
-| 10K × 4KB (warm) | 0.33s | 0.30s | 1.1x | Cache-bound |
-| 100K × 4KB (SSD) | TBD | TBD | ~3-5x | Expected |
-| 1K × 100MB files | ~same | ~same | 1.0x | copy_file_range optimal |
+| 100K × 4KB | 59.9s | 17.2s | **3.5x** | With splice + inode sort |
+
+#### Network Storage (GCP pd-balanced, cold cache, burst exhausted)
+
+| Scenario | cp -r | uring-sync | Speedup | Notes |
+|----------|-------|------------|---------|-------|
+| 100K × 100KB | 22m | 23m | **1.0x** | Throughput-limited, both hit ceiling |
+
+Key insight: **Storage speed determines where io_uring helps**:
+- Fast NVMe: io_uring wins big (CPU-bound, syscall overhead matters)
+- Slow/throttled storage: io_uring only helps for small IOPS-limited files
 
 ### Why Results May Vary
 
-1. **Storage type**: NVMe benefits most (high IOPS), HDD sees less gain
-2. **Cache state**: Warm cache reduces syscall overhead advantage
-3. **File system**: ext4/XFS/btrfs have different metadata performance
-4. **Kernel version**: io_uring improvements ongoing (5.x → 6.x)
+1. **Storage speed**: Fast NVMe sees big gains; slow storage only gains for small files
+2. **Burst credits**: Cloud storage performance varies with burst budget
+3. **Cache state**: Warm cache reduces the advantage
+4. **File size**: Small files = IOPS-limited (batching helps), large = throughput-limited
+5. **File ordering**: Inode-sorted access critical for network/spinning disk
 
-Note: Large sequential files won't see improvement - kernel's `copy_file_range()` is already zero-copy optimal.
+## When io_uring Helps: Storage Speed Matters
+
+The benefit of io_uring depends heavily on **what the bottleneck is**.
+
+### Fast Storage (NVMe): CPU is the Bottleneck
+
+On fast NVMe, the disk can easily saturate the CPU's ability to issue syscalls:
+
+```
+  Storage: NVMe (500K+ IOPS, 3+ GB/s)
+  Bottleneck: CPU / syscall overhead
+
+  io_uring Benefit: ✓ HIGH for ALL file sizes
+  - Batched syscalls reduce context switches
+  - Larger files benefit MORE (more data to pipeline)
+```
+
+| Scenario | File Size | cp -r | uring | Speedup |
+|----------|-----------|-------|-------|---------|
+| ml_large | 4KB | 7.7s | 5.1s | **1.5x** |
+| ml_images | 100KB | 22.7s | 5.4s | **4.2x** |
+
+### Slow Storage (Cloud/HDD): IOPS vs Throughput
+
+On slow storage, the disk itself is the bottleneck:
+
+| Limit Type | What it means | GCP pd-balanced example |
+|------------|---------------|------------------------|
+| **IOPS** | Operations per second | ~3,000-15,000 IOPS |
+| **Throughput** | Bytes per second | ~140-1,200 MB/s |
+
+```
+  File Size    Limit Type     io_uring Benefit
+  ─────────────────────────────────────────────
+  < 16 KB      IOPS           ✓ High (batching hides latency)
+  16-256 KB    Mixed          ~ Depends on burst credits
+  > 256 KB     Throughput     ✗ Minimal (disk is ceiling)
+```
+
+| Scenario | File Size | cp -r | uring | Speedup | Storage State |
+|----------|-----------|-------|-------|---------|---------------|
+| ml_large | 4KB | 60s | 17s | **3.5x** | With burst |
+| ml_images | 100KB | 22m | 23m | **1.0x** | Burst exhausted |
+
+### Summary: When to Use uring-sync
+
+| Storage Type | File Size | Recommendation |
+|--------------|-----------|----------------|
+| NVMe/fast SSD | Any | ✓ Use uring-sync (splice mode) |
+| Cloud storage (burst) | < 16KB | ✓ Use uring-sync |
+| Cloud storage (burst) | > 100KB | ~ Marginal benefit |
+| Cloud storage (throttled) | Any | ✗ No benefit, use cp |
+| HDD | < 16KB | ✓ Use uring-sync |
+| HDD | > 100KB | ✗ Seek-limited, use cp |
+
+## ML Dataset File Size Survey
+
+Real-world ML datasets span a wide range of file sizes:
+
+### Per-File Datasets (Individual Samples)
+
+| Dataset | Domain | Files | Avg Size | Total | Notes |
+|---------|--------|-------|----------|-------|-------|
+| MNIST | Digits | 70K | **0.8 KB** | 50 MB | Tiny grayscale images |
+| CIFAR-10 | Images | 60K | **3 KB** | 180 MB | 32×32 color images |
+| ImageNet | Images | 1.2M | **111 KB** | 133 GB | Variable JPEG sizes |
+| COCO | Detection | 330K | **115-150 KB** | 20-37 GB | JPEG, varies by year |
+| LAION-5B | Multi-modal | 5.8B | varies | **220 TB** | Distributed as parquet |
+
+### Sharded Datasets (Training Format)
+
+| Format | Typical Shard Size | Use Case |
+|--------|-------------------|----------|
+| WebDataset (tar) | **100 MB - 1 GB** | Streaming training |
+| Parquet | **100-300 MB** (row groups) | Tabular/embedding data |
+| TFRecord | **100-500 MB** | TensorFlow pipelines |
+| HuggingFace | **500 MB - 5 GB** | Hub downloads |
+
+### Implications for uring-sync
+
+| Workload | uring-sync Benefit | Notes |
+|----------|-------------------|-------|
+| MNIST/CIFAR raw | **High** | Tiny files, IOPS-limited |
+| ImageNet raw | **Moderate** | 111KB avg, mixed regime |
+| WebDataset shards | **Low** | 100MB+ shards, throughput-limited |
+| Parquet downloads | **Low** | Large shards |
+
+**Sweet spot:** Raw image datasets with files < 16KB (MNIST, CIFAR, custom datasets with thumbnails).
+
+**Not ideal:** Pre-sharded datasets (WebDataset, TFRecord, Parquet) where files are already large.
+
+## Roadmap & Positioning
+
+### Current Focus: Independent Tool for Cloud/Single-Node
+
+uring-sync targets use cases where MPI infrastructure is unavailable or overkill:
+
+| Use Case | uring-sync | mpifileutils (dcp) |
+|----------|------------|-------------------|
+| Cloud VMs (GCP/AWS) | ✓ Best fit | Overkill |
+| Single workstation | ✓ Best fit | Overkill |
+| HPC cluster + Lustre | Consider dcp | ✓ Best fit |
+| No MPI runtime | ✓ Works | ✗ Requires MPI |
+
+### Comparison with mpifileutils
+
+mpifileutils dcp uses MPI processes with blocking I/O:
+- Each process: 1 blocking I/O operation at a time
+- Parallelism via process count (typically 8-64)
+- Higher memory overhead (~50MB per process)
+
+uring-sync uses io_uring with async I/O:
+- Each worker: 128 async operations in-flight
+- 4 workers = 512 ops in-flight (vs 8-64 for dcp)
+- Lower memory overhead (~20MB total)
+
+**Note:** mpifileutils has an open issue ([#372](https://github.com/hpc/mpifileutils/issues/372)) investigating io_uring since 2020, but no implementation yet.
+
+### Development Phases
+
+| Phase | Goal | Status |
+|-------|------|--------|
+| 1 | Basic io_uring copy with state machine | ✓ Done |
+| 2 | Multi-worker, file ordering optimization | ✓ Done |
+| 3 | Zero-copy via IORING_OP_SPLICE | ✓ Done |
+| **4** | **Network transfer (send/recv)** | ✓ Done (sync I/O) |
+| 5 | kTLS + async network | Planned |
+| 6 | Benchmark vs fpsync, rclone, dcp | Planned |
+| 7 | Contribute io_uring to mpifileutils | Future |
+
+### Phase 4: Network Transfer (Complete)
+
+Basic network file transfer working:
+
+```bash
+# Receiver
+uring-sync recv /dest --listen 9999 --secret key
+
+# Sender
+uring-sync send /src host:9999 --secret key
+```
+
+**Implementation:**
+- Wire protocol in `include/protocol.hpp`
+- Sender/receiver in `src/net.cpp`
+- Uses synchronous I/O (blocking send/recv)
+- Pre-shared secret authentication (plaintext - use SSH tunnel for security)
+
+### Phase 5: kTLS + Async Network (Planned)
+
+Upgrade network transfer with:
+1. TLS 1.3 encryption via kTLS (`setsockopt(SOL_TLS)`)
+2. Zero-copy: `splice(file → pipe → TLS socket)`
+3. Async network ops via io_uring
+4. Multi-connection for higher throughput
+
+### Phase 6: Comprehensive Benchmarks
+
+Compare against other LNSF tools on real ML datasets (100M+ files):
+
+| Tool | Type | Install |
+|------|------|---------|
+| fpsync | Parallel rsync batches | `apt install fpart` |
+| rclone | Parallel transfers | Single binary |
+| dcp | MPI parallel | `apt install mpifileutils` |
+| s5cmd | S3 parallel | Single binary (S3 only) |
+
+### Phase 7: Contribute to mpifileutils
+
+Long-term goal: contribute io_uring support to libmfu (mpifileutils library):
+
+- Close their open issue [#372](https://github.com/hpc/mpifileutils/issues/372) (open since 2020)
+- Benefit: MPI coordination + io_uring efficiency = best of both worlds
+
+```
+dcp (current):   MPI process → blocking read/write
+dcp (future):    MPI process → io_uring async I/O batches
+```
 
 ## References
 
@@ -509,4 +767,7 @@ Note: Large sequential files won't see improvement - kernel's `copy_file_range()
 - [liburing API](https://github.com/axboe/liburing)
 - [Efficient IO with io_uring](https://kernel.dk/io_uring.pdf)
 - [mpifileutils dcp](https://github.com/hpc/mpifileutils) - HPC parallel copy
+- [mpifileutils io_uring issue #372](https://github.com/hpc/mpifileutils/issues/372) - Open since 2020
 - [fpart + fpsync](https://github.com/martymac/fpart) - Parallel rsync wrapper
+- [rclone](https://rclone.org/) - Multi-backend parallel file transfer
+- [s5cmd](https://github.com/peak/s5cmd) - Parallel S3 operations

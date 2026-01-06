@@ -148,6 +148,43 @@ gen_ml_large_aligned() {
     info "Created $actual files in $dir"
 }
 
+gen_ml_images() {
+    local dir="$DATA_DIR/ml_images"
+    local count=100000
+    local base=102400  # 100KB base size
+    local max_pct=20   # +/- 20% = files from 80KB to 120KB
+
+    info "Generating ml_images: ${count} files, ~100KB +/-20% (ImageNet-like, ~10GB total)"
+    warn "This will take several minutes and ~10GB disk space..."
+    rm -rf "$dir"
+    mkdir -p "$dir"
+
+    # Use parallel generation with batches for progress reporting
+    local batch_size=10000
+    local batches=$((count / batch_size))
+
+    for batch in $(seq 1 $batches); do
+        local start=$(( (batch - 1) * batch_size + 1 ))
+        local end=$((batch * batch_size))
+
+        echo "  Batch $batch/$batches (files $start-$end)..."
+
+        # Generate batch in parallel (8 workers to avoid overwhelming system)
+        for i in $(seq $start $end); do
+            gen_random_file "$dir/img_${i}.bin" $base $max_pct &
+            # Limit parallel jobs
+            if (( i % 64 == 0 )); then
+                wait
+            fi
+        done
+        wait
+    done
+
+    local actual=$(ls -1 "$dir" | wc -l)
+    local total_size=$(du -sh "$dir" | cut -f1)
+    info "Created $actual files ($total_size) in $dir"
+}
+
 gen_large_files() {
     local dir="$DATA_DIR/large_files"
     local count=10
@@ -230,7 +267,7 @@ show_status() {
     echo "Test Data Status"
     echo "========================================="
 
-    for scenario in ml_small ml_small_aligned ml_large ml_large_aligned large_files mixed deep_tree; do
+    for scenario in ml_small ml_small_aligned ml_large ml_large_aligned ml_images large_files mixed deep_tree; do
         local dir="$DATA_DIR/$scenario"
         if [[ -d "$dir" ]]; then
             local count=$(find "$dir" -type f | wc -l)
@@ -269,6 +306,9 @@ usage() {
     echo "  ml_small_aligned 10K x 4KB exact (40MB, aligned)"
     echo "  ml_large_aligned 100K x 4KB exact (400MB, aligned)"
     echo ""
+    echo "Scenarios (realistic ML datasets):"
+    echo "  ml_images        100K x ~100KB +/-20% (ImageNet-like, ~10GB)"
+    echo ""
     echo "Other scenarios:"
     echo "  large_files      10 x 100MB files (1GB)"
     echo "  mixed            1K small + 10 large (~1GB)"
@@ -300,7 +340,7 @@ fi
 
 # Determine which scenarios to generate
 if [[ $# -eq 0 || "$1" == "all" ]]; then
-    scenarios="ml_small ml_small_aligned ml_large ml_large_aligned large_files mixed deep_tree"
+    scenarios="ml_small ml_small_aligned ml_large ml_large_aligned ml_images large_files mixed deep_tree"
 else
     scenarios="$@"
 fi
@@ -319,6 +359,7 @@ for scenario in $scenarios; do
         ml_small_aligned) gen_ml_small_aligned ;;
         ml_large)         gen_ml_large ;;
         ml_large_aligned) gen_ml_large_aligned ;;
+        ml_images)        gen_ml_images ;;
         large_files)      gen_large_files ;;
         mixed)            gen_mixed ;;
         deep_tree)        gen_deep_tree ;;

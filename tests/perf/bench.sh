@@ -30,6 +30,7 @@ DROP_CACHES=false
 QUICK=false
 URING_WORKERS=1
 URING_QUEUE_DEPTH=64
+URING_SYNC=false
 
 # ============================================================
 # Argument Parsing
@@ -67,6 +68,10 @@ while [[ $# -gt 0 ]]; do
             URING_QUEUE_DEPTH="$2"
             shift 2
             ;;
+        --sync)
+            URING_SYNC=true
+            shift
+            ;;
         --data-dir=*)
             DATA_DIR="${1#*=}"
             shift
@@ -96,9 +101,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --dst-dir DIR      Set destination directory (default: ./test_data/dst)"
             echo "  -j, --uring-workers N  Number of uring-sync workers (default: 1)"
             echo "  -q, --uring-queue-depth N  Queue depth for uring-sync (default: 64)"
+            echo "  --sync               Use sync mode for uring-sync (better for network storage)"
             echo ""
             echo "Scenarios: ml_small, ml_small_aligned, ml_large, ml_large_aligned,"
-            echo "           large_files, mixed, deep_tree"
+            echo "           ml_images, large_files, mixed, deep_tree"
             echo "Tools: cp, rsync, tar, uring"
             exit 0
             ;;
@@ -110,7 +116,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Valid scenarios
-VALID_SCENARIOS="ml_small ml_small_aligned ml_large ml_large_aligned large_files mixed deep_tree"
+VALID_SCENARIOS="ml_small ml_small_aligned ml_large ml_large_aligned ml_images large_files mixed deep_tree"
 
 # If no scenarios specified, use all available
 if [[ -z "$SCENARIOS" ]]; then
@@ -208,10 +214,10 @@ for scenario in $SCENARIOS; do
 
             # Run the tool
             case $tool in
-                cp)     t=$(time_cmd run_cp "$src" "$dst") ;;
-                rsync)  t=$(time_cmd run_rsync "$src" "$dst") ;;
-                tar)    t=$(time_cmd run_tar "$src" "$dst") ;;
-                uring)  t=$(time_cmd run_uring "$src" "$dst" "$URING_WORKERS" "$URING_QUEUE_DEPTH") ;;
+                cp)    t=$(time_cmd run_cp "$src" "$dst") ;;
+                rsync) t=$(time_cmd run_rsync "$src" "$dst") ;;
+                tar)   t=$(time_cmd run_tar "$src" "$dst") ;;
+                uring) t=$(time_cmd run_uring "$src" "$dst" "$URING_WORKERS" "$URING_QUEUE_DEPTH" "$URING_SYNC") ;;
                 *)
                     warn "Unknown tool: $tool"
                     continue 2

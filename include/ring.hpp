@@ -3,8 +3,6 @@
 #include <stdexcept>
 #include <string>
 #include <fcntl.h>
-#include <vector>
-#include <sys/uio.h>
 #include "common.hpp"
 
 class RingManager {
@@ -16,39 +14,12 @@ public:
     }
 
     ~RingManager() {
-        if (buffers_registered_) {
-            io_uring_unregister_buffers(&ring);
-        }
         io_uring_queue_exit(&ring);
     }
 
     // Non-copyable
     RingManager(const RingManager&) = delete;
     RingManager& operator=(const RingManager&) = delete;
-
-    // ============================================================
-    // Buffer Registration (reduces per-I/O overhead)
-    // ============================================================
-
-    // Register buffers with the kernel for zero-copy I/O
-    bool register_buffers(const std::vector<char*>& buffers, size_t buffer_size) {
-        if (buffers_registered_) return false;
-
-        iovecs_.resize(buffers.size());
-        for (size_t i = 0; i < buffers.size(); i++) {
-            iovecs_[i].iov_base = buffers[i];
-            iovecs_[i].iov_len = buffer_size;
-        }
-
-        int ret = io_uring_register_buffers(&ring, iovecs_.data(), iovecs_.size());
-        if (ret < 0) {
-            iovecs_.clear();
-            return false;
-        }
-
-        buffers_registered_ = true;
-        return true;
-    }
 
     // ============================================================
     // File Operations
@@ -89,15 +60,6 @@ public:
         if (link) sqe->flags |= IOSQE_IO_LINK;
     }
 
-    // Read using registered buffer (zero-copy from kernel perspective)
-    void prepare_read_fixed(int fd, char* buffer, unsigned len, uint64_t offset,
-                            int buf_index, FileContext* ctx, bool link = false) {
-        struct io_uring_sqe* sqe = get_sqe();
-        io_uring_prep_read_fixed(sqe, fd, buffer, len, offset, buf_index);
-        io_uring_sqe_set_data(sqe, ctx);
-        if (link) sqe->flags |= IOSQE_IO_LINK;
-    }
-
     // Write to file (using fd)
     void prepare_write(int fd, char* buffer, unsigned len, uint64_t offset,
                        FileContext* ctx, bool link = false) {
@@ -107,21 +69,15 @@ public:
         if (link) sqe->flags |= IOSQE_IO_LINK;
     }
 
-    // Write using registered buffer
-    void prepare_write_fixed(int fd, char* buffer, unsigned len, uint64_t offset,
-                             int buf_index, FileContext* ctx, bool link = false) {
-        struct io_uring_sqe* sqe = get_sqe();
-        io_uring_prep_write_fixed(sqe, fd, buffer, len, offset, buf_index);
-        io_uring_sqe_set_data(sqe, ctx);
-        if (link) sqe->flags |= IOSQE_IO_LINK;
-    }
-
     // Splice - kernel-to-kernel zero copy (requires pipe)
+    // For file copy: src_fd → pipe_write, then pipe_read → dst_fd
     void prepare_splice(int fd_in, int64_t off_in, int fd_out, int64_t off_out,
-                        unsigned int len, unsigned int flags, FileContext* ctx) {
+                        unsigned int len, unsigned int flags, FileContext* ctx,
+                        bool link = false) {
         struct io_uring_sqe* sqe = get_sqe();
         io_uring_prep_splice(sqe, fd_in, off_in, fd_out, off_out, len, flags);
         io_uring_sqe_set_data(sqe, ctx);
+        if (link) sqe->flags |= IOSQE_IO_LINK;
     }
 
 
@@ -186,13 +142,48 @@ public:
     }
 
     unsigned int depth() const { return depth_; }
-    bool buffers_registered() const { return buffers_registered_; }
+
+    // ============================================================
+    // Network Operations
+    // ============================================================
+
+    void prepare_connect(int sockfd, const struct sockaddr* addr,
+                        socklen_t addrlen, void* ctx) {
+        struct io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_connect(sqe, sockfd, addr, addrlen);
+        io_uring_sqe_set_data(sqe, ctx);
+    }
+
+    void prepare_accept(int sockfd, struct sockaddr* addr,
+                       socklen_t* addrlen, int flags, void* ctx) {
+        struct io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_accept(sqe, sockfd, addr, addrlen, flags);
+        io_uring_sqe_set_data(sqe, ctx);
+    }
+
+    void prepare_send(int sockfd, const void* buf, size_t len,
+                     int flags, void* ctx) {
+        struct io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_send(sqe, sockfd, buf, len, flags);
+        io_uring_sqe_set_data(sqe, ctx);
+    }
+
+    void prepare_recv(int sockfd, void* buf, size_t len,
+                     int flags, void* ctx) {
+        struct io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_recv(sqe, sockfd, buf, len, flags);
+        io_uring_sqe_set_data(sqe, ctx);
+    }
+
+    void prepare_shutdown(int sockfd, int how, void* ctx) {
+        struct io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_shutdown(sqe, sockfd, how);
+        io_uring_sqe_set_data(sqe, ctx);
+    }
 
 private:
     struct io_uring ring;
     unsigned int depth_;
-    bool buffers_registered_ = false;
-    std::vector<struct iovec> iovecs_;
 
     struct io_uring_sqe* get_sqe() {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
