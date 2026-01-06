@@ -109,7 +109,7 @@ io_uring loses when: (files are large) AND (storage is slow/HDD)
 Each file copy is a state machine with these transitions:
 
 ```cpp
-enum class CopyState {
+enum class FileState {
     OPENING_SRC,    // Opening source file
     STATING,        // Getting file size
     OPENING_DST,    // Creating destination
@@ -121,20 +121,7 @@ enum class CopyState {
 };
 ```
 
-Completions drive state transitions. When a completion arrives, we look up the file context and advance its state:
-
-```cpp
-void handle_completion(FileContext& ctx, int result) {
-    switch (ctx.state) {
-        case CopyState::OPENING_SRC:
-            ctx.src_fd = result;
-            submit_stat(ctx);  // Next: get file size
-            ctx.state = CopyState::STATING;
-            break;
-        // ... more states
-    }
-}
-```
+Completions drive state transitions. When a completion arrives, we look up the file context and advance its state.
 
 ### Splice Zero-Copy
 
@@ -167,7 +154,7 @@ This encourages sequential disk access since inodes are typically allocated sequ
 
 ## What I Learned
 
-1. **Single worker beats multi-threading** for this workload. Lock contention outweighs parallelism benefits when the bottleneck is I/O.
+1. **Single worker beats multi-threading** for local NVMe. Lock contention outweighs parallelism benefits when the bottleneck is fast I/O.
 
 2. **Queue depth matters more than thread count**. 64 files in-flight per worker is the sweet spot.
 
@@ -177,9 +164,13 @@ This encourages sequential disk access since inodes are typically allocated sequ
 
 5. **io_uring isn't magic**. It reduces syscall overhead—but if you're I/O bound on slow storage, syscalls aren't your bottleneck.
 
+## What's Next: Network Transfer
+
+This tool now also supports **network file transfer** with kTLS encryption, achieving 58% faster transfers than rsync. See the companion post: [Beating rsync by 58% with Kernel TLS](/blog-ktls-vs-rsync.md).
+
 ## Code
 
-The full implementation is ~400 lines of C++20. Key components:
+The full implementation is ~500 lines of C++20. Key components:
 
 | Component | Purpose |
 |-----------|---------|
@@ -190,7 +181,7 @@ The full implementation is ~400 lines of C++20. Key components:
 | `FileContext` | Per-file state machine |
 
 Build requirements:
-- Linux kernel 5.1+ (5.19+ for some features)
+- Linux kernel 5.1+ (5.19+ for splice)
 - liburing
 - C++20
 
@@ -210,7 +201,7 @@ io_uring can dramatically speed up small-file workloads—4.2x in our best case.
 
 ---
 
-*The code is available at [GitHub link]. Benchmarks were run on Ubuntu 24.04 with kernel 6.14 on local NVMe and GCP Compute Engine VMs.*
+*The code is available at [github.com/VincentDu2021/uring_sync](https://github.com/VincentDu2021/uring_sync). Benchmarks were run on Ubuntu 24.04 with kernel 6.14 on local NVMe and GCP Compute Engine VMs.*
 
 ---
 
