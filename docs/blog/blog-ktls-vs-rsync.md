@@ -1,14 +1,14 @@
 ---
-title: "Beating rsync by 58% with Kernel TLS"
+title: "Building a Fast File Transfer Tool, Part 2: Beating rsync by 58% with kTLS"
 published: false
-description: "How moving encryption from userspace SSH to Linux kTLS achieved 58% faster file transfers than rsync. With benchmarks and implementation details."
+description: "Adding network transfer to uring-sync with kernel TLS encryption. 58% faster than rsync for large datasets by moving encryption from userspace to kernel."
 tags: linux, networking, security, performance
 series: "High-Performance File Transfer"
 ---
 
-# Beating rsync by 58% with Kernel TLS
+# Building a Fast File Transfer Tool, Part 2: Beating rsync by 58% with kTLS
 
-I built a file transfer tool that's **58% faster than rsync** for large dataset transfers. The secret? Moving encryption from userspace SSH into the Linux kernel using kTLS.
+In [Part 1](https://dev.to/vincentdu2021/building-a-file-copier-4x-faster-than-cp-using-iouring-4b5n), I built **uring-sync**—a file copier that's 4.2x faster than `cp` for local copies using io_uring. Now I've added **network transfer** with kernel TLS encryption, achieving **58% faster transfers than rsync**.
 
 ## The Problem: SSH is the Bottleneck
 
