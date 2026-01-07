@@ -105,7 +105,7 @@ transfer mode where it helps with multiple TCP connections and CPU-bound encrypt
 | `IORING_OP_CLOSE` | Close file descriptors | - |
 | `IORING_OP_MKDIRAT` | Create directories | - |
 | `IORING_OP_LINKAT` | Hard link (same fs optimization) | - |
-| `IORING_OP_COPY_FILE_RANGE` | Zero-copy for large files | - |
+| `IORING_OP_SPLICE` | Zero-copy via pipe (src→pipe→dst) | `SPLICE_F_MOVE` |
 
 ## Core Data Structures
 
@@ -326,7 +326,7 @@ Registered buffers (`io_uring_register_buffers`) pre-pin memory to avoid per-I/O
 
 **Why it doesn't help:** Registered buffers amortize their cost over many operations per buffer (e.g., network servers reusing receive buffers thousands of times). Our workload uses each buffer 1-2 times per file then releases it. The buffer index lookup overhead exceeds the pin/unpin savings.
 
-See `docs/registered-buffers-analysis.md` for detailed analysis.
+See `docs/notes/registered-buffers-analysis.md` for detailed analysis.
 
 ### 3. Registered File Descriptors
 
@@ -341,15 +341,19 @@ io_uring_prep_openat(sqe, 0, filename, flags, mode);  // 0 = first registered fd
 sqe->flags |= IOSQE_FIXED_FILE;
 ```
 
-### 4. Zero-Copy for Large Files
+### 4. Zero-Copy for Large Files (NOT AVAILABLE)
 
-Switch to `copy_file_range` for files > threshold:
+`IORING_OP_COPY_FILE_RANGE` is not available in kernel headers (checked 6.14). Instead, we use splice-based zero-copy:
 
 ```cpp
-if (file_size > ZERO_COPY_THRESHOLD) {  // e.g., 1MB
-    io_uring_prep_copy_file_range(sqe, src_fd, 0, dst_fd, 0, file_size, 0);
-}
+// Current implementation: splice via kernel pipe (no userspace copies)
+// SPLICE_IN: src_fd → pipe
+io_uring_prep_splice(sqe, src_fd, offset, pipe_write, -1, len, SPLICE_F_MOVE);
+// SPLICE_OUT: pipe → dst_fd
+io_uring_prep_splice(sqe, pipe_read, -1, dst_fd, offset, len, SPLICE_F_MOVE);
 ```
+
+For synchronous code paths, `copy_file_range()` syscall can be used directly.
 
 ### 5. Hard Link Detection
 
@@ -431,60 +435,108 @@ io_uring_prep_splice(sqe, pipe_read, -1, dst_fd, offset, len, SPLICE_F_MOVE);
 
 **Future:** Linked splice ops (submit SPLICE_IN + SPLICE_OUT together)
 
+### 8. kTLS + Splice (NOT BENEFICIAL for Network)
+
+For network transfer, we investigated using kTLS with splice for zero-copy file→socket transfer:
+
+```cpp
+// Expected zero-copy: file → pipe → kTLS socket
+splice(src_fd, pipe_write, ...)  // file to pipe
+splice(pipe_read, tls_socket, ...)  // pipe to encrypted socket
+```
+
+**Result:** 2.9x SLOWER than read/send.
+
+**Root cause (discovered via strace):**
+```
+splice(file→pipe):   27μs     ← instant
+splice(pipe→socket): 33ms     ← 1000x slower! Blocks on TCP ACKs
+```
+
+The `splice(pipe → kTLS socket)` call blocks waiting for TCP acknowledgments. The kernel cannot buffer aggressively like it does with regular `send()` calls.
+
+**Recommendation:** For network transfer, use `--tls` without `--splice`. The kTLS kernel encryption still works with regular send(), providing 58% speedup over rsync without the splice blocking issue.
+
+See `docs/BENCHMARKS.md` for detailed timing data.
+
 ## CLI Interface
 
 ```
-Usage: uring-sync [options] <source> <destination>
+Local copy:
+  uring-sync [options] <source> <destination>
 
-Options:
-  -j, --jobs <n>          Number of worker threads (default: 1, optimal for local copy)
+Network transfer:
+  uring-sync send <source> <host:port> [options]
+  uring-sync recv <destination> --listen <port> [options]
+
+Common options:
+  -j, --jobs <n>          Number of worker threads (default: 1)
   -c, --chunk-size <size> I/O buffer size (default: 128K)
   -q, --queue-depth <n>   io_uring queue depth per worker (default: 64)
+  -v, --verbose           Verbose output
+  -h, --help              Show this help
+
+Local copy options:
+  --sync                  Use synchronous I/O (for benchmarking)
+  --no-splice             Use read/write instead of splice zero-copy
+
+Network options:
+  --secret <key>          Pre-shared secret for authentication
+  --tls                   Enable kTLS encryption (AES-128-GCM)
+  --uring                 Use io_uring for network I/O (experimental)
+  --splice                Use splice for file→socket (slower for small files)
+
+Planned options:
   -p, --preserve          Preserve timestamps and permissions
   -n, --dry-run           Show what would be copied
-  -v, --verbose           Verbose output
   --progress              Show progress bar
   --resume <file>         Resume from checkpoint file
   --exclude <pattern>     Exclude files matching pattern
-  -h, --help              Show this help
 
 Examples:
-  # Copy ImageNet dataset (single worker is optimal for local copy)
+  # Local copy (single worker optimal for NVMe)
   uring-sync /data/imagenet /ssd/imagenet
 
-  # Copy with progress and preservation
-  uring-sync -p --progress /backup/photos /external/photos
+  # Local copy with multiple workers (for network storage)
+  uring-sync -j 4 -q 128 /data /network-mount/backup
 
-  # Dry run to see what would be copied
-  uring-sync -n /src /dst
+  # Network transfer with kTLS encryption
+  uring-sync recv /backup --listen 9999 --secret mykey --tls
+  uring-sync send /data remote-host:9999 --secret mykey --tls
+
+  # Network transfer over SSH tunnel (alternative to --tls)
+  ssh -L 9999:localhost:9999 user@remote
+  uring-sync send /data localhost:9999 --secret mykey
 ```
 
 ## Implementation Phases
 
-### Phase 1: Single-Threaded Multi-File (MVP)
-- [ ] Refactor current code to handle multiple files
-- [ ] Implement FileContext state machine
-- [ ] Add buffer pool
-- [ ] Support directory argument (non-recursive)
-- [ ] Basic progress reporting
+### Phase 1: Single-Threaded Multi-File (MVP) ✓
+- [x] Refactor current code to handle multiple files
+- [x] Implement FileContext state machine
+- [x] Add buffer pool
+- [x] Support directory argument (non-recursive)
+- [x] Basic progress reporting
 
-### Phase 2: Directory Traversal
-- [ ] Add recursive directory walking
-- [ ] Create destination directory structure
+### Phase 2: Directory Traversal ✓
+- [x] Add recursive directory walking
+- [x] Create destination directory structure
 - [ ] Handle symlinks (copy vs preserve)
-- [ ] Path transformation (src prefix → dst prefix)
+- [x] Path transformation (src prefix → dst prefix)
 
-### Phase 3: Multi-Threading
-- [ ] Implement lock-free work queue
-- [ ] Worker thread pool
-- [ ] Per-thread io_uring instances
-- [ ] Atomic statistics
+### Phase 3: Multi-Threading ✓
+- [x] Implement lock-free work queue
+- [x] Worker thread pool
+- [x] Per-thread io_uring instances
+- [x] Atomic statistics
 
-### Phase 4: Optimizations
+### Phase 4: Optimizations (Partial)
 - [ ] Linked SQEs for open+read chains
-- [x] Registered buffers - **Investigated, not beneficial** (see docs/registered-buffers-analysis.md)
+- [x] Registered buffers - **Investigated, not beneficial** (see docs/notes/registered-buffers-analysis.md)
 - [ ] Hard link detection
-- [ ] copy_file_range for large files (blocked: no kernel op)
+- [x] copy_file_range - **Investigated, no IORING_OP_COPY_FILE_RANGE in kernel**
+- [x] Splice zero-copy - **Implemented and working**
+- [x] Inode sorting for sequential access
 - [ ] NUMA-aware buffer allocation
 
 ### Phase 5: Production Features
@@ -707,10 +759,11 @@ uring-sync uses io_uring with async I/O:
 | 1 | Basic io_uring copy with state machine | ✓ Done |
 | 2 | Multi-worker, file ordering optimization | ✓ Done |
 | 3 | Zero-copy via IORING_OP_SPLICE | ✓ Done |
-| **4** | **Network transfer (send/recv)** | ✓ Done (sync I/O) |
-| 5 | kTLS + async network | Planned |
-| 6 | Benchmark vs fpsync, rclone, dcp | Planned |
-| 7 | Contribute io_uring to mpifileutils | Future |
+| 4 | Network transfer (send/recv) | ✓ Done (sync I/O) |
+| **5** | **kTLS encryption** | ✓ Done (58% faster than rsync) |
+| 6 | Async network with io_uring | Experimental (`--uring` flag) |
+| 7 | Benchmark vs fpsync, rclone, dcp | Planned |
+| 8 | Contribute io_uring to mpifileutils | Future |
 
 ### Phase 4: Network Transfer (Complete)
 
@@ -730,15 +783,33 @@ uring-sync send /src host:9999 --secret key
 - Uses synchronous I/O (blocking send/recv)
 - Pre-shared secret authentication (plaintext - use SSH tunnel for security)
 
-### Phase 5: kTLS + Async Network (Planned)
+### Phase 5: kTLS Encryption (Complete)
 
-Upgrade network transfer with:
-1. TLS 1.3 encryption via kTLS (`setsockopt(SOL_TLS)`)
-2. Zero-copy: `splice(file → pipe → TLS socket)`
-3. Async network ops via io_uring
-4. Multi-connection for higher throughput
+Network transfer with kernel TLS encryption:
 
-### Phase 6: Comprehensive Benchmarks
+```bash
+# Enable with --tls flag
+uring-sync recv /backup --listen 9999 --secret key --tls
+uring-sync send /data remote:9999 --secret key --tls
+```
+
+**Implementation:**
+- TLS 1.2 AES-128-GCM via kTLS (`setsockopt(SOL_TLS)`)
+- HKDF key derivation from pre-shared secret
+- Kernel handles encryption, not userspace OpenSSL
+
+**Performance:** 58% faster than rsync for large transfers (9.7GB dataset)
+
+**Note:** kTLS + splice was investigated but found to be 2.9x slower (see Optimization #8).
+
+### Phase 6: Async Network (Experimental)
+
+Async network I/O via io_uring (enabled with `--uring` flag):
+- Batched file reads with io_uring
+- Network send remains synchronous
+- Multi-connection support for higher throughput (planned)
+
+### Phase 7: Comprehensive Benchmarks
 
 Compare against other LNSF tools on real ML datasets (100M+ files):
 
@@ -749,7 +820,7 @@ Compare against other LNSF tools on real ML datasets (100M+ files):
 | dcp | MPI parallel | `apt install mpifileutils` |
 | s5cmd | S3 parallel | Single binary (S3 only) |
 
-### Phase 7: Contribute to mpifileutils
+### Phase 8: Contribute to mpifileutils
 
 Long-term goal: contribute io_uring support to libmfu (mpifileutils library):
 

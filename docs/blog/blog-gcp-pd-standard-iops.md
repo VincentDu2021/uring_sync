@@ -1,3 +1,10 @@
+---
+title: "GCP pd-standard: We Observed 78x the Documented IOPS Limit"
+published: false
+description: "Benchmarking 100K file copies on GCP revealed 10,000+ IOPS on a disk documented at 75-150 IOPS. Exploring undocumented burst credits."
+tags: gcp, cloud, performance, devops
+---
+
 # GCP pd-standard: We Observed 78x the Documented IOPS Limit
 
 I recently benchmarked copying 100,000 small files on a GCP VM with a pd-standard disk. The documented IOPS for our 100GB disk is approximately **75-150 IOPS**. We observed effective rates of **10,000+ IOPS**—roughly **78x above the documented limit**.

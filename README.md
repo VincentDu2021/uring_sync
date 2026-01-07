@@ -4,6 +4,21 @@ High-performance file transfer tool for ML datasets using Linux io_uring and kTL
 
 **58% faster than rsync** for large encrypted transfers. **4.2x faster than `cp`** for local copies.
 
+## Why uring-sync?
+
+Traditional file tools are bottlenecked by **syscall overhead** and **userspace encryption**:
+
+| Bottleneck | Traditional | uring-sync |
+|------------|-------------|------------|
+| Syscalls | 1 file at a time | 64 files batched via io_uring |
+| Data copies | User ↔ kernel copies | Zero-copy via splice |
+| Encryption | Userspace OpenSSL (SSH) | Kernel AES-NI via kTLS |
+
+**Design goals:**
+1. **Leverage io_uring** - Batch syscalls, async I/O, 64 files in-flight
+2. **Zero-copy transfers** - splice() moves data without touching userspace
+3. **Kernel encryption** - kTLS offloads TLS to kernel, uses hardware AES-NI
+
 ## Features
 
 - **Local copy**: Async I/O with io_uring, splice zero-copy
@@ -29,13 +44,8 @@ High-performance file transfer tool for ML datasets using Linux io_uring and kTL
 
 ## Quick Start
 
-### Build
-
 ```bash
-# Dependencies (Ubuntu/Debian)
-sudo apt install liburing-dev libfmt-dev libssl-dev
-
-# Build
+# Build (see System Requirements for dependencies)
 make
 ```
 
@@ -98,13 +108,43 @@ Options:
   --splice      Use splice for file→socket (slower for small files)
 ```
 
-## Requirements
+## System Requirements
 
-- Linux kernel 5.1+ (5.19+ for all features)
-- liburing
-- libfmt
-- OpenSSL (for kTLS key derivation)
-- C++20 compiler
+### Kernel Features
+
+uring-sync leverages modern Linux kernel features. Here's what you need:
+
+| Feature | Kernel | Used For | Fallback |
+|---------|--------|----------|----------|
+| io_uring | 5.1+ | Async batched I/O | `--sync` flag |
+| IORING_OP_SPLICE | 5.7+ | Zero-copy local transfer | `--no-splice` flag |
+| kTLS (TLS_TX) | 4.13+ | Kernel encryption (send) | SSH tunnel |
+| kTLS (TLS_RX) | 4.17+ | Kernel decryption (recv) | SSH tunnel |
+
+**Recommended: Linux 5.7+** for all features. Ubuntu 20.04+, Debian 11+, or recent Fedora/Arch.
+
+Check your kernel:
+```bash
+uname -r                           # Kernel version
+cat /boot/config-$(uname -r) | grep CONFIG_TLS  # kTLS support
+```
+
+### Build Dependencies
+
+```bash
+# Ubuntu/Debian
+sudo apt install liburing-dev libfmt-dev libssl-dev
+
+# Fedora
+sudo dnf install liburing-devel fmt-devel openssl-devel
+
+# Arch
+sudo pacman -S liburing fmt openssl
+```
+
+### Compiler
+
+- C++20 compiler (GCC 10+, Clang 12+)
 
 ## Project Structure
 
@@ -142,15 +182,15 @@ sudo ./tests/perf/bench.sh --scenario ml_large --cold
 
 ## Documentation
 
-- [Design Document](DESIGN.md) - Architecture and implementation details
-- [Network Design](NETWORK_DESIGN.md) - kTLS and network transfer design
-- [Benchmarks](BENCHMARKS.md) - Detailed benchmark results
+- [Design Document](docs/DESIGN.md) - Architecture and implementation details
+- [Network Design](docs/NETWORK_DESIGN.md) - kTLS and network transfer design
+- [Benchmarks](docs/BENCHMARKS.md) - Detailed benchmark results
 
 ### Blog Posts
 
-- [Building a File Copier 4x Faster Than cp](docs/blog-io-uring-file-copier.md)
-- [Beating rsync by 58% with Kernel TLS](docs/blog-ktls-vs-rsync.md)
-- [GCP pd-standard: 78x the Documented IOPS](docs/blog-gcp-pd-standard-iops.md)
+- [Building a File Copier 4x Faster Than cp](docs/blog/blog-io-uring-file-copier.md)
+- [Beating rsync by 58% with Kernel TLS](docs/blog/blog-ktls-vs-rsync.md)
+- [GCP pd-standard: 78x the Documented IOPS](docs/blog/blog-gcp-pd-standard-iops.md)
 
 ## Performance Tips
 

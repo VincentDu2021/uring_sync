@@ -1,3 +1,11 @@
+---
+title: "Beating rsync by 58% with Kernel TLS"
+published: false
+description: "How moving encryption from userspace SSH to Linux kTLS achieved 58% faster file transfers than rsync. With benchmarks and implementation details."
+tags: linux, networking, security, performance
+series: "High-Performance File Transfer"
+---
+
 # Beating rsync by 58% with Kernel TLS
 
 I built a file transfer tool that's **58% faster than rsync** for large dataset transfers. The secret? Moving encryption from userspace SSH into the Linux kernel using kTLS.
