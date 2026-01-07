@@ -1,3 +1,11 @@
+---
+title: "Building a File Copier 4x Faster Than cp Using io_uring"
+published: false
+description: "How I used Linux io_uring to build a file copier that's 4.2x faster than cp for ML datasets. Lessons on when async I/O helps—and when it doesn't."
+tags: linux, cpp, performance, tutorial
+series: "High-Performance File Transfer"
+---
+
 # Building a File Copier That's 4x Faster Than `cp` Using io_uring
 
 I built a high-performance file copier for ML datasets using Linux io_uring. On the right workload, it's **4.2x faster than `cp -r`**. Here's what I learned about when async I/O helps—and when it doesn't.
@@ -70,37 +78,14 @@ Key design decisions:
 
 Consistent 2x improvement on cloud SSD storage.
 
-### GCP pd-standard (HDD-backed, 100GB)
+## Why io_uring Helps
 
-| Workload | cp -r | uring-sync | Speedup |
-|----------|-------|------------|---------|
-| 100K × 4KB files | 60s | 19s | **3.2x** |
-| 100K × 100KB files | 266s | 1054s | **0.25x (slower!)** |
+On fast storage (NVMe, SSD), the bottleneck is **CPU and syscall overhead**, not the disk:
 
-Wait, uring is *slower* for medium files on HDD? Yes. Here's why.
+- **cp -r**: Processes files sequentially, 12+ syscalls per file
+- **io_uring**: 64 files in-flight, batched syscalls, async completion
 
-## When io_uring Helps (And When It Doesn't)
-
-### Fast Storage (NVMe, SSD)
-
-- **Bottleneck**: CPU/syscall overhead
-- **io_uring advantage**: Batching reduces context switches
-- **Result**: Larger files benefit MORE (4.2x for 100KB vs 1.5x for 4KB)
-
-### Slow Storage (HDD, Throttled Cloud)
-
-- **Bottleneck**: IOPS (I/O operations per second)
-- **io_uring advantage**: Batching hides latency for small files
-- **Problem**: Parallel random access kills HDDs
-
-HDDs have spinning platters. When we issue 64 parallel reads, the head seeks constantly. Sequential access (like `cp -r`) is actually better for large files on HDD.
-
-### The Sweet Spot
-
-```
-io_uring wins when: (files are small) OR (storage is fast)
-io_uring loses when: (files are large) AND (storage is slow/HDD)
-```
+The bigger the files, the more time we spend waiting for I/O to complete—and the more io_uring's async approach helps. That's why we see 4.2x speedup for 100KB files vs 1.5x for 4KB files on NVMe.
 
 ## Implementation Details
 
@@ -158,19 +143,17 @@ This encourages sequential disk access since inodes are typically allocated sequ
 
 2. **Queue depth matters more than thread count**. 64 files in-flight per worker is the sweet spot.
 
-3. **Storage characteristics determine everything**. The same code is 4x faster OR 4x slower depending on the disk.
+3. **Profile your actual workload**. Synthetic benchmarks lie. Test with your real data.
 
-4. **Profile your actual workload**. Synthetic benchmarks lie. Test with your real data.
-
-5. **io_uring isn't magic**. It reduces syscall overhead—but if you're I/O bound on slow storage, syscalls aren't your bottleneck.
+4. **io_uring shines on fast storage**. When the disk can keep up, reducing syscall overhead yields big gains.
 
 ## What's Next: Network Transfer
 
-This tool now also supports **network file transfer** with kTLS encryption, achieving 58% faster transfers than rsync. See the companion post: [Beating rsync by 58% with Kernel TLS](/blog-ktls-vs-rsync.md).
+This tool now also supports **network file transfer** with kTLS encryption, achieving 58% faster transfers than rsync. See the companion post: [Beating rsync by 58% with Kernel TLS](blog-ktls-vs-rsync.md).
 
 ## Code
 
-The full implementation is ~500 lines of C++20. Key components:
+The local copy implementation is ~1,400 lines of C++20. Key components:
 
 | Component | Purpose |
 |-----------|---------|
@@ -187,22 +170,18 @@ Build requirements:
 
 ## Conclusion
 
-io_uring can dramatically speed up small-file workloads—4.2x in our best case. But it's not universally faster. Understanding your storage characteristics is essential.
+io_uring can dramatically speed up small-file workloads—**4.2x faster on NVMe** and **2x faster on cloud SSD**. The key is reducing syscall overhead through batching and async I/O.
 
 **When to use io_uring for file copying:**
-- Millions of small files (<100KB)
+- Many small files (ML datasets, source trees)
 - Fast storage (NVMe, SSD)
 - CPU-bound on syscall overhead
 
-**When to stick with `cp -r`:**
-- Large files on HDD
-- Throttled cloud storage hitting IOPS limits
-- Simple one-off copies (not worth the complexity)
+**When `cp -r` is fine:**
+- Single large files (already efficient)
+- One-off copies where complexity isn't worth it
 
 ---
 
 *The code is available at [github.com/VincentDu2021/uring_sync](https://github.com/VincentDu2021/uring_sync). Benchmarks were run on Ubuntu 24.04 with kernel 6.14 on local NVMe and GCP Compute Engine VMs.*
 
----
-
-**Tags:** #linux #iouring #cpp #performance #filesystems #ml
